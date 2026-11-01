@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔎 DocuRAG-Copilot
+# 🔎 DenseParse
 
 ### Production-grade Retrieval-Augmented Generation with Hybrid Search, Semantic Caching & Cloud Deployment
 
