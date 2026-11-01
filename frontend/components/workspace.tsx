@@ -52,7 +52,7 @@ export function Workspace() {
           <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
             <FileSearch className="size-4" aria-hidden="true" />
           </div>
-          <span className="text-sm font-semibold">DocuRAG Copilot</span>
+          <span className="text-sm font-semibold">DenseParse</span>
         </div>
 
         <nav className="flex flex-col gap-1 p-3">

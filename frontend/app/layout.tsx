@@ -4,7 +4,7 @@ import { AuthProvider } from '@/lib/auth-context'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'DocuRAG Copilot',
+  title: 'DenseParse',
   description: 'Chat with SEC filings and your own documents',
   generator: 'v0.app',
   icons: {
