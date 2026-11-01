@@ -137,8 +137,8 @@ flowchart LR
 
 ### 1. Clone
 ```bash
-https://github.com/pateltark/DocuRAG-Copilot.git
-cd DocuRAG-Copilot
+https://github.com/pateltark/DenseParse.git
+cd DenseParse
 ```
 
 ### 2. Configure
