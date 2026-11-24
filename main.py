@@ -1,26 +1,30 @@
 import os
 import uuid
+import asyncio
 import tempfile
 import logging
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Query
+import threading
+
+from fastapi import (
+    FastAPI, UploadFile, File, HTTPException, Depends, Query, BackgroundTasks
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from jose import JWTError
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi import BackgroundTasks
+from pypdf import PdfReader  # pip install pypdf  (add to requirements.txt)
+
 from agent.llm_agent import ask_upload, ask_sec
 from rag.emb_chunks import create_vectorstore
 from auth import hash_password, verify_password, create_access_token, decode_token
 from rag.db import (
-    save_user_info, get_user_by_email, get_user_by_id, save_chat, save_emb,
+    save_user_info, get_user_by_email, get_user_by_id, save_chat,
     save_doc_info, update_document_status, get_user_documents, list_sec_documents,
     delete_document, load_chat, clear_chat, list_chats
 )
 from agent.session import get_active_doc, get_active_set
-import asyncio
 
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -30,53 +34,76 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="SEC Edgar Research API")
+app = FastAPI(title="DenSparse API")
 
 security = HTTPBearer()
 
-origins = [
+# ── CORS ────────────────────────────────────────────────────
+# Add your real frontend URL(s) here, or set CORS_ORIGINS="https://a.com,https://b.com"
+DEFAULT_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://65.2.146.75:3000",
 ]
+origins = [
+    o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()
+] or DEFAULT_ORIGINS
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# ── Request / response models ───────────────────────────────
 class QueryRequest(BaseModel):
     question: str
     document_ids: list[str] | None = None
     chat_id: str | None = None  # None => start a new chat section
 
+
 class RegisterRequest(BaseModel):
-    user_id: str
+    # user_id is generated server-side now; if the frontend still sends it,
+    # pydantic simply ignores the extra field.
     email: str
     password: str
     name: str
+
 
 class LoginRequest(BaseModel):
     email: str
     password: str
 
-# ── Updated DocumentOut Pydantic Model ─────────────────────
+
 class DocumentOut(BaseModel):
     id: str
     filename: str
-    status: str  # Reflects 'processing', 'ready', or 'failed'
+    status: str  # 'processing', 'ready', or 'failed'
 
 
+# ── Limits (tune via env vars, no code change needed) ───────
 MAX_COMPARE_DOCS = 5
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", 10))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", 5))  # OCR is heavy, so images get a smaller cap
+MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
+
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", 50))
+MAX_DOCS_PER_USER = int(os.getenv("MAX_DOCS_PER_USER", 5))
+
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg"}
 ALLOWED_EXTENSIONS = {
-    "pdf", "docx", "doc", "pptx", "xlsx", 
+    "pdf", "docx", "doc", "pptx", "xlsx",
     "csv", "txt", "md", "html", "png", "jpg", "jpeg"
 }
 
+# Only one heavy parse/embed job at a time (t3.small has 2 GB RAM).
+# Extra jobs wait here and their status stays "processing".
+_processing_lock = threading.Semaphore(1)
 
 
 # ── Rate limiter setup ──────────────────────────────────────
@@ -87,7 +114,7 @@ def _build_redis_url() -> str:
     password = os.getenv("REDIS_PASSWORD", "")
     db = os.getenv("REDIS_DB", "0")
     auth = f":{password}@" if password else ""
-    # Added protocol=2 to force RESP2 compatibility for older Redis servers
+    # protocol=2 forces RESP2 compatibility for older Redis servers
     return f"redis://{auth}{host}:{port}/{db}?protocol=2"
 
 
@@ -125,10 +152,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     )
     return JSONResponse(
         status_code=429,
-        content={
-            "error": "rate_limited",
-            "message": message,
-        },
+        content={"error": "rate_limited", "message": message},
     )
 
 
@@ -148,9 +172,11 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
 
+# ── Background document processing ──────────────────────────
 def _process_document(tmp_path: str, user_id: str, doc_id: str):
     try:
-        create_vectorstore(tmp_path, user_id, document_id=doc_id)
+        with _processing_lock:  # one heavy job at a time
+            create_vectorstore(tmp_path, user_id, document_id=doc_id)
         update_document_status(doc_id, "ready")
     except Exception as exc:
         update_document_status(doc_id, "failed")
@@ -160,11 +186,19 @@ def _process_document(tmp_path: str, user_id: str, doc_id: str):
             os.unlink(tmp_path)
 
 
+# ── Documents ───────────────────────────────────────────────
 @app.get("/documents", response_model=list[DocumentOut])
 def list_documents(user=Depends(get_current_user)):
     return get_user_documents(user["sub"])
 
 
+@app.delete("/documents/{document_id}")
+def delete_document_route(document_id: str, user=Depends(get_current_user)):
+    delete_document(user_id=user["sub"], document_id=document_id)
+    return {"message": "Document deleted."}
+
+
+# ── Auth ────────────────────────────────────────────────────
 @app.post("/auth/register")
 @limiter.limit("5/minute")
 def register(request: Request, body: RegisterRequest):
@@ -172,7 +206,8 @@ def register(request: Request, body: RegisterRequest):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered.")
     hashed = hash_password(body.password)
-    save_user_info(body.user_id, body.email, hashed, body.name)
+    user_id = str(uuid.uuid4())  # never trust a client-supplied id
+    save_user_info(user_id, body.email, hashed, body.name)
     return {"message": "User registered successfully."}
 
 
@@ -199,8 +234,7 @@ def health():
     return {"status": "ok"}
 
 
-# ── Refactored /upload Endpoint ─────────────────────────────
-
+# ── Upload ──────────────────────────────────────────────────
 @app.post("/upload")
 @limiter.limit("5/minute")
 async def upload_document(
@@ -214,22 +248,53 @@ async def upload_document(
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported file format '.{ext}'.")
 
-    file_suffix = f".{ext}" if ext else ""
+    max_bytes = MAX_IMAGE_BYTES if ext in IMAGE_EXTENSIONS else MAX_UPLOAD_BYTES
+    max_mb = max_bytes // (1024 * 1024)
+
+    # Quick reject using Content-Length (can be spoofed, so the streaming
+    # check below is the real protection). 1 MB slack for multipart overhead.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > max_bytes + 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File exceeds the {max_mb} MB upload limit.")
+
+    # Per-user quota (failed documents don't count)
+    active_docs = [d for d in get_user_documents(user["sub"]) if d["status"] != "failed"]
+    if len(active_docs) >= MAX_DOCS_PER_USER:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Document limit reached ({MAX_DOCS_PER_USER}). Delete one to upload another.",
+        )
+
     total = 0
     tmp_path = None
-
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
             tmp_path = tmp.name
-            while chunk := await file.read(1024 * 1024):  # read in 1MB chunks
+            while chunk := await file.read(1024 * 1024):  # 1 MB chunks
                 total += len(chunk)
-                if total > MAX_UPLOAD_BYTES:
+                if total > max_bytes:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit."
+                        detail=f"File exceeds the {max_mb} MB upload limit.",
                     )
                 tmp.write(chunk)
-    except HTTPException:
+
+        # Page limit for PDFs. Must be checked here: the background task
+        # can't send an error back to the user.
+        if ext == "pdf":
+            try:
+                pages = await asyncio.to_thread(lambda: len(PdfReader(tmp_path).pages))
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not read this PDF (it may be corrupted or password-protected).",
+                )
+            if pages > MAX_PDF_PAGES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"PDF has {pages} pages. The maximum is {MAX_PDF_PAGES}.",
+                )
+    except Exception:  # covers HTTPException AND client disconnects
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
@@ -237,59 +302,14 @@ async def upload_document(
     doc_id = save_doc_info(user["sub"], file.filename, status="processing")
     background_tasks.add_task(_process_document, tmp_path, user["sub"], doc_id)
 
-    return {"message": "Upload received, processing.", "document_id": doc_id, "status": "processing"}
-
-    
-# @app.post("/upload")
-# async def upload_document(file: UploadFile = File(...), user=Depends(get_current_user)):
-#     filename = file.filename or ""
-#     ext = filename.split(".")[-1].lower() if "." in filename else ""
-
-#     if ext not in ALLOWED_EXTENSIONS:
-#         raise HTTPException(
-#             status_code=400,
-#             detail=f"Unsupported file format '.{ext}'. Allowed formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
-#         )
-
-#     file_suffix = f".{ext}" if ext else ""
-
-#     with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp:
-#         tmp.write(await file.read())
-#         tmp_path = tmp.name
-
-#     # 1. Create entry with 'processing' status
-#     doc_id = save_doc_info(user["sub"], file.filename, status="processing")
-
-#     try:
-#         # 2. Run embedding work inside thread pool
-#         await asyncio.to_thread(create_vectorstore, tmp_path, user["sub"], document_id=doc_id)
-        
-#         # 3. Mark document as 'ready' if processing completes without errors
-#         update_document_status(doc_id, "ready")
-
-#     except Exception as exc:
-#         # 4. Mark document as 'failed' if any step in extraction/embedding throws an exception
-#         update_document_status(doc_id, "failed")
-#         logger.error(f"Failed embedding pipeline for document {doc_id}: {exc}")
-        
-#         raise HTTPException(
-#             status_code=500,
-#             detail=f"Document processing failed during embedding creation: {str(exc)}"
-#         )
-        
-#     finally:
-#         if os.path.exists(tmp_path):
-#             os.unlink(tmp_path)
-
-#     return {"message": "Document indexed successfully.", "document_id": doc_id, "status": "ready"}
+    return {
+        "message": "Upload received, processing.",
+        "document_id": doc_id,
+        "status": "processing",
+    }
 
 
-@app.delete("/upload")
-def clear_pdf(user=Depends(get_current_user)):
-    pdf_ready = False
-    return {"message": "PDF cleared."}
-
-
+# ── Chat ────────────────────────────────────────────────────
 @app.post("/chat/doc")
 @limiter.limit("10/minute")
 async def chat_with_doc(request: Request, req: QueryRequest, user=Depends(get_current_user)):
@@ -304,10 +324,12 @@ async def chat_with_doc(request: Request, req: QueryRequest, user=Depends(get_cu
 
     save_chat(user_id=user_id, role="user", content=req.question, mode="doc", chat_id=chat_id)
 
-    answer = ask_upload(
-        question=req.question, 
-        user_id=user_id, 
-        document_ids=req.document_ids
+    # ask_upload is a blocking LLM call: run it in a thread so the event loop stays free
+    answer = await asyncio.to_thread(
+        ask_upload,
+        question=req.question,
+        user_id=user_id,
+        document_ids=req.document_ids,
     )
 
     save_chat(user_id=user_id, role="assistant", content=answer, mode="doc", chat_id=chat_id)
@@ -322,7 +344,9 @@ async def chat_with_sec(request: Request, req: QueryRequest, user=Depends(get_cu
     chat_id = req.chat_id or str(uuid.uuid4())
 
     save_chat(user_id=user_id, role="user", content=req.question, mode="sec", chat_id=chat_id)
-    answer = ask_sec(question=req.question, user_id=user_id)
+
+    answer = await asyncio.to_thread(ask_sec, question=req.question, user_id=user_id)
+
     save_chat(user_id=user_id, role="assistant", content=answer, mode="sec", chat_id=chat_id)
 
     return {
@@ -330,7 +354,7 @@ async def chat_with_sec(request: Request, req: QueryRequest, user=Depends(get_cu
         "chat_id": chat_id,
         "active_doc": get_active_doc(user_id),
         "active_set": get_active_set(user_id),
-    } 
+    }
 
 
 @app.get("/sec/active")
@@ -347,13 +371,7 @@ def sec_documents(user=Depends(get_current_user)):
     return list_sec_documents()
 
 
-@app.delete("/documents/{document_id}")
-def delete_document_route(document_id: str, user=Depends(get_current_user)):
-    delete_document(user_id=user["sub"], document_id=document_id)
-    return {"message": "Document deleted."}
-
-
-# ── Chat sections (sidebar) ────────────────────────────────
+# ── Chat sections (sidebar) ─────────────────────────────────
 @app.get("/chat/sessions")
 def get_chat_sessions(
     mode: str = Query("sec", description="Chat mode: 'sec' or 'doc'"),
@@ -364,7 +382,7 @@ def get_chat_sessions(
     return list_chats(user_id=user["sub"], mode=mode)
 
 
-# ── Chat history (single section) ──────────────────────────
+# ── Chat history (single section) ───────────────────────────
 @app.get("/chat/history")
 async def get_history(
     mode: str = Query("sec", description="Chat mode: 'sec' or 'doc'"),

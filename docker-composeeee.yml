@@ -1,12 +1,15 @@
 services:
+  # 1. PostgreSQL Database (with pgvector extension)
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: docurag-postgres
+    container_name: denseparse-postgres
     restart: always
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-Login@100}
       POSTGRES_DB: ${DB_NAME:-ai}
+    ports:
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -15,10 +18,13 @@ services:
       timeout: 5s
       retries: 5
 
+  # 2. Redis Cache
   redis:
     image: redis:7-alpine
-    container_name: docurag-redis
+    container_name: denseparse-redis
     restart: always
+    ports:
+      - "6379:6379"
     volumes:
       - redisdata:/data
     healthcheck:
@@ -27,10 +33,15 @@ services:
       timeout: 5s
       retries: 5
 
+  # 3. FastAPI Backend Application
   backend:
-    image: <dockerhub-user>/docurag-backend:v1
-    container_name: docurag-backend
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: denseparse-backend
     restart: always
+    ports:
+      - "8000:8000"
     env_file:
       - ./.env
     environment:
@@ -38,14 +49,14 @@ services:
       - DB_PORT=5432
       - DB_NAME=${DB_NAME:-ai}
       - DB_USER=${DB_USER:-postgres}
-      - DB_PASSWORD=${DB_PASSWORD:?set DB_PASSWORD in .env}
+      - DB_PASSWORD=${DB_PASSWORD:-Login@100}
       - DB_POOL_MAX=${DB_POOL_MAX:-10}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - REDIS_DB=${REDIS_DB:-0}
       - REDIS_SSL=${REDIS_SSL:-False}
-      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-docurag-uploads-bucket}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-denseparse-uploads-bucket}
       - HF_HOME=/root/.cache/huggingface
     depends_on:
       postgres:
@@ -53,23 +64,18 @@ services:
       redis:
         condition: service_healthy
 
+  # 4. Next.js Frontend Application
   frontend:
-    image: <dockerhub-user>/docurag-frontend:v1
-    container_name: docurag-frontend
-    restart: always
-    depends_on:
-      - backend
-
-  caddy:
-    image: caddy:2-alpine
-    container_name: docurag-caddy
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: denseparse-frontend
     restart: always
     ports:
-      - "80:80"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
     depends_on:
-      - frontend
       - backend
 
 volumes:

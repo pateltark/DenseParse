@@ -1,4 +1,4 @@
-// API client for the SEC Edgar Research FastAPI backend.
+// API.TS --> API client for the SEC Edgar Research FastAPI backend.
 // The base URL is configurable via NEXT_PUBLIC_API_URL and defaults to the
 // local FastAPI dev server.
 
@@ -94,7 +94,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
           window.location.href = "/"
         }
         // Return a pending promise to halt downstream execution while redirecting
-        return new Promise<T>(() => {})
+        return new Promise<T>(() => { })
       }
     }
 
