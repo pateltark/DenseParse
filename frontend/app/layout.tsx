@@ -1,12 +1,12 @@
 import { Analytics } from '@vercel/analytics/next'
 import type { Metadata, Viewport } from 'next'
 import { AuthProvider } from '@/lib/auth-context'
+import { APP_NAME } from '@/lib/config'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'DenseParse',
+  title: APP_NAME,
   description: 'Chat with SEC filings and your own documents',
-  generator: 'v0.app',
   icons: {
     icon: [
       {

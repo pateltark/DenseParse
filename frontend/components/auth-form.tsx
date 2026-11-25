@@ -4,6 +4,7 @@ import { useState, type FormEvent } from "react"
 import { Button } from "@/components/ui/button"
 import { useAuth } from "@/lib/auth-context"
 import { ApiError } from "@/lib/api"
+import { APP_NAME } from "@/lib/config"
 import { FileSearch } from "lucide-react"
 
 export function AuthForm() {
@@ -26,6 +27,7 @@ export function AuthForm() {
         await register({ name, email, password })
       }
     } catch (err) {
+      // 429 (too many attempts) arrives here with the backend's friendly message.
       setError(err instanceof ApiError ? err.message : "Something went wrong. Please try again.")
     } finally {
       setLoading(false)
@@ -39,9 +41,7 @@ export function AuthForm() {
           <div className="mb-4 flex size-12 items-center justify-center rounded-xl bg-primary text-primary-foreground">
             <FileSearch className="size-6" aria-hidden="true" />
           </div>
-          <h1 className="text-2xl font-semibold tracking-tight text-balance">
-            SEC Edgar Research
-          </h1>
+          <h1 className="text-2xl font-semibold tracking-tight text-balance">{APP_NAME}</h1>
           <p className="mt-2 text-sm text-muted-foreground text-pretty">
             {mode === "login"
               ? "Sign in to chat with SEC filings and your documents."

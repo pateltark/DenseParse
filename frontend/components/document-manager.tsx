@@ -7,30 +7,13 @@ import {
   ApiError,
   deleteDocument,
   listDocuments,
-  uploadPdf, // Can be renamed in lib/api later if desired
+  uploadDocument,
   type UserDocument,
 } from "@/lib/api"
+import { ACCEPT_STRING, UPLOAD_LIMITS, validateFile } from "@/lib/config"
 import { FileText, Loader2, Trash2, Upload, AlertCircle } from "lucide-react"
 
-const MAX_COMPARE_DOCS = 5
-
-// List of extensions supported by Docling
-const ALLOWED_EXTENSIONS = [
-  "pdf",
-  "docx",
-  "doc",
-  "pptx",
-  "xlsx",
-  "csv",
-  "txt",
-  "md",
-  "html",
-  "png",
-  "jpg",
-  "jpeg",
-]
-
-const ACCEPT_STRING = ALLOWED_EXTENSIONS.map((ext) => `.${ext}`).join(",")
+const MAX_COMPARE_DOCS = UPLOAD_LIMITS.maxCompare
 
 export function DocumentManager({
   selectedIds,
@@ -43,11 +26,15 @@ export function DocumentManager({
     revalidateOnFocus: false,
     // Keep polling every 3s as long as at least one document is still
     // being processed server-side (Docling parsing + embeddings run in
-    // the background now, so the list needs to catch up on its own).
+    // the background, so the list needs to catch up on its own).
     refreshInterval: (latestData) =>
       latestData?.some((d) => d.status === "processing") ? 3000 : 0,
   })
   const documents = data ?? []
+
+  // Failed documents don't count toward the quota (same rule as the backend).
+  const activeCount = documents.filter((d) => d.status !== "failed").length
+  const atLimit = activeCount >= UPLOAD_LIMITS.maxDocs
 
   const inputRef = useRef<HTMLInputElement>(null)
   const [uploading, setUploading] = useState(false)
@@ -57,22 +44,33 @@ export function DocumentManager({
   async function onFileSelected(file: File | undefined) {
     if (!file) return
 
-    const ext = file.name.split(".").pop()?.toLowerCase() || ""
-    if (!ALLOWED_EXTENSIONS.includes(ext)) {
-      setError(`Unsupported file extension (.${ext}). Please upload a supported document or image.`)
+    if (atLimit) {
+      setError(
+        `Document limit reached (${UPLOAD_LIMITS.maxDocs}). Delete one to upload another.`,
+      )
+      if (inputRef.current) inputRef.current.value = ""
+      return
+    }
+
+    // Quick type + size check before sending anything over the network.
+    const problem = validateFile(file)
+    if (problem) {
+      setError(problem)
+      if (inputRef.current) inputRef.current.value = ""
       return
     }
 
     setError(null)
     setUploading(true)
     try {
-      // uploadPdf now resolves as soon as the backend accepts the file
-      // (status: "processing") rather than waiting for embeddings to
-      // finish, so this only shows "Uploading..." briefly.
-      await uploadPdf(file)
+      // Resolves as soon as the backend accepts the file (status: "processing")
+      // rather than waiting for embeddings to finish.
+      await uploadDocument(file)
       await mutate()
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Upload failed.")
+      // The backend may have rejected for quota/limits, so refresh the list.
+      void mutate()
     } finally {
       setUploading(false)
       if (inputRef.current) inputRef.current.value = ""
@@ -112,7 +110,9 @@ export function DocumentManager({
         <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
           Your Documents
         </h3>
-        <span className="text-xs text-muted-foreground">{documents.length}</span>
+        <span className="text-xs text-muted-foreground">
+          {activeCount}/{UPLOAD_LIMITS.maxDocs}
+        </span>
       </div>
 
       <input
@@ -127,15 +127,21 @@ export function DocumentManager({
         size="sm"
         className="w-full"
         onClick={() => inputRef.current?.click()}
-        disabled={uploading}
+        disabled={uploading || atLimit}
+        title={atLimit ? "Document limit reached. Delete one to upload another." : undefined}
       >
         {uploading ? (
           <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
         ) : (
           <Upload className="size-3.5" aria-hidden="true" />
         )}
-        {uploading ? "Uploading…" : "Upload Document"}
+        {uploading ? "Uploading…" : atLimit ? "Limit reached" : "Upload Document"}
       </Button>
+
+      <p className="text-xs text-muted-foreground text-pretty">
+        Max file size: 10 MB per document (images {UPLOAD_LIMITS.maxImageMb} MB, up to{" "}
+        {UPLOAD_LIMITS.maxPages} pages for PDFs).
+      </p>
 
       {error && (
         <p className="rounded-lg bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive" role="alert">

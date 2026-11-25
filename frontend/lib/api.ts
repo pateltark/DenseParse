@@ -1,11 +1,14 @@
-// API.TS --> API client for the SEC Edgar Research FastAPI backend.
-// The base URL is configurable via NEXT_PUBLIC_API_URL and defaults to the
-// local FastAPI dev server.
+// API client for the DenseParse FastAPI backend.
+// Uses NEXT_PUBLIC_API_URL when set, and defaults to same-origin ("")
+// so reverse proxies like Caddy can route requests without hardcoding localhost.
+
+import { validateFile } from "@/lib/config"
 
 export const API_URL =
-  process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") || "http://localhost:8000"
+  process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? ""
 
-const TOKEN_KEY = "sec_edgar_token"
+// Renamed from "sec_edgar_token". Existing sessions will be logged out once.
+const TOKEN_KEY = "denseparse_token"
 
 export function getToken(): string | null {
   if (typeof window === "undefined") return null
@@ -37,6 +40,12 @@ type RequestOptions = {
   isForm?: boolean
 }
 
+// Used when the server (or a proxy like nginx) returns a non-JSON error body.
+const STATUS_FALLBACKS: Record<number, string> = {
+  413: "That file is too large for the server.",
+  429: "Too many requests. Please wait a moment and try again.",
+}
+
 // Guards against firing the redirect more than once if several requests
 // 401 around the same time (e.g. sidebar + panel both loading on mount).
 let redirectingToLogin = false
@@ -65,13 +74,13 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     res = await fetch(`${API_URL}${path}`, { method, headers, body: payload })
   } catch {
     throw new ApiError(
-      `Could not reach the backend at ${API_URL}. Make sure FastAPI is running and reachable.`,
+      `Could not reach the backend at ${API_URL || "the server"}. Make sure FastAPI is running and reachable.`,
       0,
     )
   }
 
   if (!res.ok) {
-    let detail = `Request failed (${res.status})`
+    let detail = STATUS_FALLBACKS[res.status] ?? `Request failed (${res.status})`
     try {
       const data = await res.json()
       if (data?.detail) {
@@ -94,7 +103,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
           window.location.href = "/"
         }
         // Return a pending promise to halt downstream execution while redirecting
-        return new Promise<T>(() => { })
+        return new Promise<T>(() => {})
       }
     }
 
@@ -122,8 +131,8 @@ export type ChatSession = {
 export type UserDocument = {
   id: string
   filename: string
-  // Backend now returns this — used to poll and show per-document
-  // processing state instead of blocking the whole upload button.
+  // Used to poll and show per-document processing state instead of
+  // blocking the whole upload button.
   status: "processing" | "ready" | "failed"
 }
 
@@ -153,7 +162,9 @@ export type CurrentUser = {
 
 // ---- Auth ----
 export function register(input: {
-  user_id: string
+  // The backend now generates the user id and ignores this field,
+  // so it is optional here and can be dropped from callers.
+  user_id?: string
   email: string
   password: string
   name: string
@@ -190,11 +201,11 @@ export function listSecDocuments() {
   return request<unknown[]>("/sec/documents")
 }
 
-export function uploadPdf(file: File) {
-  const MAX_SIZE = 25 * 1024 * 1024
-  if (file.size > MAX_SIZE) {
-    return Promise.reject(new ApiError(`File exceeds the ${MAX_SIZE / (1024 * 1024)}MB upload limit.`, 413))
-  }
+export function uploadDocument(file: File) {
+  // Fast client-side check (type + size). The backend enforces the same limits.
+  const problem = validateFile(file)
+  if (problem) return Promise.reject(new ApiError(problem, 400))
+
   const form = new FormData()
   form.append("file", file)
   return request<{ message: string; document_id: string; status: string }>("/upload", {
@@ -203,6 +214,9 @@ export function uploadPdf(file: File) {
     isForm: true,
   })
 }
+
+// Kept so any other file that still imports the old name keeps working.
+export const uploadPdf = uploadDocument
 
 export function deleteDocument(documentId: string) {
   return request<{ message: string }>(`/documents/${documentId}`, {
